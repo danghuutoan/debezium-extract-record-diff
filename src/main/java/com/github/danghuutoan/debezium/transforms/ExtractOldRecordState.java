@@ -22,23 +22,15 @@ import org.apache.kafka.connect.connector.ConnectRecord;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
-import org.apache.kafka.connect.errors.ConnectException;
-import org.apache.kafka.connect.header.ConnectHeaders;
-import org.apache.kafka.connect.header.Headers;
 import org.apache.kafka.connect.transforms.ExtractField;
 import org.apache.kafka.connect.transforms.InsertField;
 import org.apache.kafka.connect.transforms.Transformation;
 import org.apache.kafka.connect.transforms.util.SchemaUtil;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.data.Envelope;
-import io.debezium.data.Envelope.FieldName;
-import io.debezium.data.Envelope.Operation;
 import io.debezium.pipeline.txmetadata.TransactionMonitor;
-import io.debezium.transforms.ExtractNewRecordStateConfigDefinition.DeleteHandling;
 import io.debezium.util.BoundedConcurrentHashMap;
 import io.debezium.util.Strings;
 import io.debezium.transforms.ExtractNewRecordStateConfigDefinition;
@@ -64,22 +56,13 @@ import io.debezium.transforms.SmtManager;
  */
 public class ExtractOldRecordState<R extends ConnectRecord<R>> implements Transformation<R> {
 
-  private static final Logger LOGGER = LoggerFactory.getLogger(ExtractOldRecordState.class);
-
   private static final String PURPOSE = "source field insertion";
   private static final int SCHEMA_CACHE_SIZE = 64;
   private static final Pattern FIELD_SEPARATOR = Pattern.compile("\\.");
   private static final Pattern NEW_FIELD_SEPARATOR = Pattern.compile(":");
-
-  private boolean dropTombstones;
-  private DeleteHandling handleDeletes;
-  private List<FieldReference> additionalHeaders;
   private List<FieldReference> additionalFields;
-  private String routeByField;
   private final ExtractField<R> afterDelegate = new ExtractField.Value<R>();
   private final ExtractField<R> beforeDelegate = new ExtractField.Value<R>();
-  private final InsertField<R> removedDelegate = new InsertField.Value<R>();
-  private final InsertField<R> updatedDelegate = new InsertField.Value<R>();
   private BoundedConcurrentHashMap<Schema, Schema> schemaUpdateCache;
   private SmtManager<R> smtManager;
 
@@ -87,22 +70,6 @@ public class ExtractOldRecordState<R extends ConnectRecord<R>> implements Transf
   public void configure(final Map<String, ?> configs) {
     final Configuration config = Configuration.from(configs);
     smtManager = new SmtManager<>(config);
-
-    final Field.Set configFields = Field.setOf(ExtractNewRecordStateConfigDefinition.DROP_TOMBSTONES, ExtractNewRecordStateConfigDefinition.HANDLE_DELETES);
-    if (!config.validateAndRecord(configFields, LOGGER::error)) {
-      throw new ConnectException("Unable to validate config.");
-    }
-
-    dropTombstones = config.getBoolean(ExtractNewRecordStateConfigDefinition.DROP_TOMBSTONES);
-    handleDeletes = DeleteHandling.parse(config.getString(ExtractNewRecordStateConfigDefinition.HANDLE_DELETES));
-
-    String addFieldsPrefix = config.getString(ExtractNewRecordStateConfigDefinition.ADD_FIELDS_PREFIX);
-    String addHeadersPrefix = config.getString(ExtractNewRecordStateConfigDefinition.ADD_HEADERS_PREFIX);
-    additionalFields = FieldReference.fromConfiguration(addFieldsPrefix, config.getString(ExtractNewRecordStateConfigDefinition.ADD_FIELDS));
-    additionalHeaders = FieldReference.fromConfiguration(addHeadersPrefix, config.getString(ExtractNewRecordStateConfigDefinition.ADD_HEADERS));
-
-    String routeFieldConfig = config.getString(ExtractNewRecordStateConfigDefinition.ROUTE_BY_FIELD);
-    routeByField = routeFieldConfig.isEmpty() ? null : routeFieldConfig;
 
     Map<String, String> delegateConfig = new LinkedHashMap<>();
     delegateConfig.put("field", "before");
@@ -112,30 +79,12 @@ public class ExtractOldRecordState<R extends ConnectRecord<R>> implements Transf
     delegateConfig.put("field", "after");
     afterDelegate.configure(delegateConfig);
 
-    delegateConfig = new HashMap<>();
-    delegateConfig.put("static.field", ExtractNewRecordStateConfigDefinition.DELETED_FIELD);
-    delegateConfig.put("static.value", "true");
-    removedDelegate.configure(delegateConfig);
-
-    delegateConfig = new HashMap<>();
-    delegateConfig.put("static.field", ExtractNewRecordStateConfigDefinition.DELETED_FIELD);
-    delegateConfig.put("static.value", "false");
-    updatedDelegate.configure(delegateConfig);
-
     schemaUpdateCache = new BoundedConcurrentHashMap<>(SCHEMA_CACHE_SIZE);
   }
 
   @Override
   public R apply(final R record) {
     if (record.value() == null) {
-      if (dropTombstones) {
-        LOGGER.trace("Tombstone {} arrived and requested to be dropped", record.key());
-        return null;
-      }
-      if (!additionalHeaders.isEmpty()) {
-        Headers headersToAdd = makeHeaders(additionalHeaders, (Struct) record.value());
-        headersToAdd.forEach(h -> record.headers().add(h));
-      }
       return record;
     }
 
@@ -143,91 +92,13 @@ public class ExtractOldRecordState<R extends ConnectRecord<R>> implements Transf
       return record;
     }
 
-    if (!additionalHeaders.isEmpty()) {
-      Headers headersToAdd = makeHeaders(additionalHeaders, (Struct) record.value());
-      headersToAdd.forEach(h -> record.headers().add(h));
-    }
-
     R newRecord = afterDelegate.apply(record);
     R oldRecord = beforeDelegate.apply(record);
     List<String> diffFields = getDiffFields(newRecord, oldRecord);
-    if (newRecord.value() == null) {
-      if (routeByField != null) {
-        Struct recordValue = requireStruct(record.value(), "Read record to set topic routing for DELETE");
-        String newTopicName = recordValue.getStruct("before").getString(routeByField);
-        newRecord = setTopic(newTopicName, newRecord);
-      }
-
-      // Handling delete records
-      switch (handleDeletes) {
-        case DROP:
-          LOGGER.trace("Delete message {} requested to be dropped", record.key());
-          return null;
-        case REWRITE:
-          LOGGER.trace("Delete message {} requested to be rewritten", record.key());
-//          R oldRecord = beforeDelegate.apply(record);
-          oldRecord = addFields(additionalFields, record, oldRecord, diffFields);
-
-          return removedDelegate.apply(oldRecord);
-        default:
-          return newRecord;
-      }
-    }
-    else {
-
-      // Add on any requested source fields from the original record to the new unwrapped record
-      if (routeByField != null) {
-        Struct recordValue = requireStruct(newRecord.value(), "Read record to set topic routing for CREATE / UPDATE");
-        String newTopicName = recordValue.getString(routeByField);
-        newRecord = setTopic(newTopicName, newRecord);
-      }
-
-      newRecord = addFields(additionalFields, record, newRecord, diffFields);
-
-      // Handling insert and update records
-      switch (handleDeletes) {
-        case REWRITE:
-          LOGGER.trace("Insert/update message {} requested to be rewritten", record.key());
-          return updatedDelegate.apply(newRecord);
-        default:
-          return newRecord;
-      }
-    }
+    return addFields(additionalFields, record, record, diffFields);
   }
 
-  private R setTopic(String updatedTopicValue, R record) {
-    String topicName = updatedTopicValue == null ? record.topic() : updatedTopicValue;
 
-    return record.newRecord(
-            topicName,
-            record.kafkaPartition(),
-            record.keySchema(),
-            record.key(),
-            record.valueSchema(),
-            record.value(),
-            record.timestamp());
-  }
-
-  /**
-   * Create an Headers object which contains the headers to be added.
-   */
-  private Headers makeHeaders(List<FieldReference> additionalHeaders, Struct originalRecordValue) {
-    Headers headers = new ConnectHeaders();
-
-    for (FieldReference fieldReference : additionalHeaders) {
-      // add "d" operation header to tombstone events
-      if (originalRecordValue == null) {
-        if (FieldName.OPERATION.equals(fieldReference.field)) {
-          headers.addString(fieldReference.getNewField(), Operation.DELETE.code());
-        }
-        continue;
-      }
-      headers.add(fieldReference.getNewField(), fieldReference.getValue(originalRecordValue),
-              fieldReference.getSchema(originalRecordValue.schema()));
-    }
-
-    return headers;
-  }
 
   private  List<String> getDiffFields(R unwrappedNewRecord, R unwrappedOldRecord) {
     List<String> diffFields = new ArrayList<>();
@@ -242,7 +113,6 @@ public class ExtractOldRecordState<R extends ConnectRecord<R>> implements Transf
         boolean isEqual = new_field_value == null ? old_field_value == null : new_field_value.equals(old_field_value);
         if (isEqual == false)
           diffFields.add(field_name);
-        LOGGER.trace("diff ", isEqual);
       }
     }
 
@@ -255,19 +125,17 @@ public class ExtractOldRecordState<R extends ConnectRecord<R>> implements Transf
     Struct originalRecordValue = (Struct) originalRecord.value();
 
     Schema updatedSchema = schemaUpdateCache.computeIfAbsent(value.schema(),
-            s -> makeUpdatedSchema(additionalFields, value.schema(), originalRecordValue));
+            s -> makeUpdatedSchema(value.schema(), originalRecordValue));
 
     // Update the value with the new fields
     Struct updatedValue = new Struct(updatedSchema);
     for (org.apache.kafka.connect.data.Field field : value.schema().fields()) {
-      updatedValue.put(field.name(), value.get(field));
+      Object field_value = value.get(field);
+      if (field_value != null) updatedValue.put(field.name(), field_value);
 
     }
 
     updatedValue.put("changed_fields", diffFields);
-    for (FieldReference fieldReference : additionalFields) {
-      updatedValue = updateValue(fieldReference, updatedValue, originalRecordValue);
-    }
 
     return unwrappedRecord.newRecord(
             unwrappedRecord.topic(),
@@ -279,28 +147,16 @@ public class ExtractOldRecordState<R extends ConnectRecord<R>> implements Transf
             unwrappedRecord.timestamp());
   }
 
-  private Schema makeUpdatedSchema(List<FieldReference> additionalFields, Schema schema, Struct originalRecordValue) {
+  private Schema makeUpdatedSchema(Schema schema, Struct originalRecordValue) {
     // Get fields from original schema
     SchemaBuilder builder = SchemaUtil.copySchemaBasics(schema, SchemaBuilder.struct());
     for (org.apache.kafka.connect.data.Field field : schema.fields()) {
       builder.field(field.name(), field.schema());
     }
 
-    // Update the schema with the new fields
-    for (FieldReference fieldReference : additionalFields) {
-      builder = updateSchema(fieldReference, builder, originalRecordValue.schema());
-    }
     SchemaBuilder changedFieldSchema = (SchemaBuilder) SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional();
     builder.field("changed_fields",changedFieldSchema);
     return builder.build();
-  }
-
-  private SchemaBuilder updateSchema(FieldReference fieldReference, SchemaBuilder builder, Schema originalRecordSchema) {
-    return builder.field(fieldReference.getNewField(), fieldReference.getSchema(originalRecordSchema));
-  }
-
-  private Struct updateValue(FieldReference fieldReference, Struct updatedValue, Struct struct) {
-    return updatedValue.put(fieldReference.getNewField(), fieldReference.getValue(struct));
   }
 
   @Override
@@ -317,8 +173,6 @@ public class ExtractOldRecordState<R extends ConnectRecord<R>> implements Transf
   public void close() {
     beforeDelegate.close();
     afterDelegate.close();
-    removedDelegate.close();
-    updatedDelegate.close();
   }
 
   /**
