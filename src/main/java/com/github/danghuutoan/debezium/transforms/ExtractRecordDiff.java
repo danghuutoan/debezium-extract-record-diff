@@ -54,7 +54,7 @@ import io.debezium.transforms.SmtManager;
  * @param <R> the subtype of {@link ConnectRecord} on which this transformation will operate
  * @author Jiri Pechanec
  */
-public class ExtractOldRecordState<R extends ConnectRecord<R>> implements Transformation<R> {
+public class ExtractRecordDiff<R extends ConnectRecord<R>> implements Transformation<R> {
 
   private static final String PURPOSE = "source field insertion";
   private static final int SCHEMA_CACHE_SIZE = 64;

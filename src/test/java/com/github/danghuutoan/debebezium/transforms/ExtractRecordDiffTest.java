@@ -18,7 +18,7 @@ import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.Test;
 
-import com.github.danghuutoan.debezium.transforms.ExtractOldRecordState;
+import com.github.danghuutoan.debezium.transforms.ExtractRecordDiff;
 
 import io.debezium.data.Envelope;
 import io.debezium.pipeline.txmetadata.TransactionMonitor;
@@ -26,7 +26,7 @@ import io.debezium.pipeline.txmetadata.TransactionMonitor;
 /**
  * @author Jiri Pechanec
  */
-public class ExtractOldRecordStateTest {
+public class ExtractRecordDiffTest {
 
   final Schema recordSchema = SchemaBuilder.struct()
       .field("id", Schema.INT8_SCHEMA)
@@ -118,7 +118,7 @@ public class ExtractOldRecordStateTest {
 
   @Test
   public void testIgnoreUnknownRecord() {
-    try (final ExtractOldRecordState<SourceRecord> transform = new ExtractOldRecordState<>()) {
+    try (final ExtractRecordDiff<SourceRecord> transform = new ExtractRecordDiff<>()) {
       final Map<String, String> props = new HashMap<>();
       transform.configure(props);
 
@@ -132,7 +132,7 @@ public class ExtractOldRecordStateTest {
 
   @Test
   public void testHandleDeleteRecord() {
-    try (final ExtractOldRecordState<SourceRecord> transform = new ExtractOldRecordState<>()) {
+    try (final ExtractRecordDiff<SourceRecord> transform = new ExtractRecordDiff<>()) {
       final Map<String, String> props = new HashMap<>();
       transform.configure(props);
 
@@ -144,7 +144,7 @@ public class ExtractOldRecordStateTest {
 
   @Test
   public void testUnwrapCreateRecord() {
-    try (final ExtractOldRecordState<SourceRecord> transform = new ExtractOldRecordState<>()) {
+    try (final ExtractRecordDiff<SourceRecord> transform = new ExtractRecordDiff<>()) {
       final Map<String, String> props = new HashMap<>();
       transform.configure(props);
 
@@ -156,7 +156,7 @@ public class ExtractOldRecordStateTest {
 
   @Test
   public void testUnwrapUpdateRecord() {
-    try (final ExtractOldRecordState<SourceRecord> transform = new ExtractOldRecordState<>()) {
+    try (final ExtractRecordDiff<SourceRecord> transform = new ExtractRecordDiff<>()) {
       final Map<String, String> props = new HashMap<>();
       transform.configure(props);
 
